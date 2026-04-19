@@ -6,15 +6,47 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
-from dotenv import load_dotenv
 
 # Allow importing existing backend modules directly.
 BACKEND_DIR = Path(__file__).resolve().parent / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-# Load backend env so Streamlit can access GROQ_API_KEY and related vars.
-load_dotenv(BACKEND_DIR / ".env")
+
+def _load_backend_env() -> None:
+    """
+    Load env vars from backend/.env.
+    Uses python-dotenv if available; otherwise falls back to a simple parser
+    so Streamlit can run even when dotenv isn't installed.
+    """
+    env_path = BACKEND_DIR / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        from dotenv import load_dotenv  # type: ignore
+
+        load_dotenv(env_path)
+        return
+    except Exception:
+        pass
+
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        # Keep app running even if env file parsing fails.
+        return
+
+
+_load_backend_env()
 
 from models.schemas import CoachRequest, PredictRequest, RoadmapRequest, SessionContext  # noqa: E402
 from services.coach_agent import run_coach_agent_sync  # noqa: E402
