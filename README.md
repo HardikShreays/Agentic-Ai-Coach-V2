@@ -59,6 +59,22 @@ npm install
 npm run dev
 ```
 
+### 3) Streamlit (single-app mode for assignment)
+
+If you want to run the project as one Python app (without React + FastAPI servers), use:
+
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+pip install streamlit
+cd ..
+streamlit run streamlit_app.py
+```
+
+This mode includes Predict, Roadmap, AI Coach, and Resume Evaluation in one Streamlit UI.
+
 ## Environment Configuration
 
 Use the example files as templates:

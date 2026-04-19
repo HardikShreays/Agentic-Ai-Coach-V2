@@ -17,17 +17,14 @@ load_dotenv()
 app = FastAPI(title="AcadPipeline v2 Backend")
 
 
-def _cors_origins() -> list[str]:
-    raw = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins(),  # cookies require explicit origins (no "*")
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if os.getenv("ENABLE_CORS", "true").lower() in {"1", "true", "yes"}:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.on_event("startup")
