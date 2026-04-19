@@ -1,0 +1,32 @@
+{
+  "documents": [
+    {
+      "title": "SDE role preparation basics",
+      "role": "sde",
+      "topic": "interview",
+      "source": "internal-playbook",
+      "content": "For entry-level SDE roles in India, recruiters prioritize DSA problem solving, CS fundamentals, and project depth. Build a 12-week plan with daily coding practice, two mock interviews per week, and one production-style project with clear README, architecture notes, and measurable outcomes. Focus DSA on arrays, strings, hash maps, trees, graphs, DP, and greedy patterns."
+    },
+    {
+      "title": "Data analyst roadmap essentials",
+      "role": "data-analyst",
+      "topic": "skills",
+      "source": "internal-playbook",
+      "content": "Data analyst hiring focuses on SQL, Excel, BI dashboards, and business communication. Students should complete one end-to-end portfolio case study each month: define KPI, clean data, build dashboard, and present recommendations. Emphasize storytelling with data, practical SQL joins/window functions, and A/B test interpretation."
+    },
+    {
+      "title": "Resume bullet writing for freshers",
+      "role": "general",
+      "topic": "resume",
+      "source": "internal-playbook",
+      "content": "Strong fresher resume bullets follow action plus problem plus impact. Example: Built Flask API for attendance prediction using linear regression, reduced manual analysis time by 60 percent, documented model assumptions. Keep bullets specific, include tools and outcomes, avoid generic claims like hardworking and team player."
+    },
+    {
+      "title": "Placement interview strategy",
+      "role": "general",
+      "topic": "career",
+      "source": "internal-playbook",
+      "content": "Interview prep should be split into technical preparation and communication preparation. Track a weekly scorecard: coding questions solved, mock interview feedback themes, project explanation quality, and behavioral story readiness. Use STAR format for HR rounds and always connect answers to business impact and learning velocity."
+    }
+  ]
+}
