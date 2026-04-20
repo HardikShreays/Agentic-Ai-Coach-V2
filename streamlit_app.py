@@ -48,6 +48,16 @@ def _load_backend_env() -> None:
 
 _load_backend_env()
 
+# Fail fast with a clear UI message if Cloud/local env skipped installing deps.
+try:
+    import pydantic  # noqa: F401
+except ModuleNotFoundError:
+    st.error(
+        "Missing dependency `pydantic`. On Streamlit Cloud, commit the repo root `requirements.txt` "
+        "(flat list, not `-r backend/...`) and redeploy so `pip install` runs successfully."
+    )
+    st.stop()
+
 from models.schemas import CoachRequest, PredictRequest, RoadmapRequest, SessionContext  # noqa: E402
 from services.coach_agent import run_coach_agent_sync  # noqa: E402
 from services.ml_engine import init_models, predict  # noqa: E402

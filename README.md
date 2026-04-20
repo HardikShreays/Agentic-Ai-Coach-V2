@@ -64,14 +64,13 @@ npm run dev
 If you want to run the project as one Python app (without React + FastAPI servers), use:
 
 ```bash
-cd backend
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-pip install streamlit
-cd ..
 streamlit run streamlit_app.py
 ```
+
+Use the **repository root** `requirements.txt` (it includes backend deps + Streamlit). Streamlit Cloud also reads this file from the repo root.
 
 This mode includes Predict, Roadmap, AI Coach, and Resume Evaluation in one Streamlit UI.
 
