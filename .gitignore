@@ -23,6 +23,10 @@ venv/
 .venv/
 env/
 
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+
 # Environment and secrets
 .env
 .env.*
