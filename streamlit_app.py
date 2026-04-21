@@ -299,6 +299,7 @@ def _rag_retrieve_node(state: CoachRAGState) -> CoachRAGState:
 
 def _agent_decide_node(state: CoachRAGState) -> CoachRAGState:
     user_prompt = state.get("query", "")
+    chat_history = state.get("chat_history", [])
     system_prompt = (
         "You are a planner for a student coaching agent.\n"
         "Pick at most one tool to call based on user intent.\n"
@@ -311,7 +312,7 @@ def _agent_decide_node(state: CoachRAGState) -> CoachRAGState:
         '{"action":"tool|respond","tool_name":"...","args":{...},"reason":"..."}.\n'
         "If required fields are missing, choose action=respond."
     )
-    raw = _groq_chat(system_prompt, f"User message: {user_prompt}") or ""
+    raw = _groq_chat(system_prompt, f"User message: {user_prompt}", chat_history) or ""
     state["planner_llm_error"] = st.session_state.get("last_groq_error", "")
     plan = _extract_json_object(raw)
     if not plan:
@@ -360,6 +361,7 @@ def _should_run_tool(state: CoachRAGState) -> str:
 
 def _rag_generate_node(state: CoachRAGState) -> CoachRAGState:
     user_prompt = state.get("query", "")
+    chat_history = state.get("chat_history", [])
     predict_result = st.session_state.get("predict_result")
     roadmap = st.session_state.get("roadmap")
     context_text = state.get("context_text", "")
@@ -378,7 +380,7 @@ def _rag_generate_node(state: CoachRAGState) -> CoachRAGState:
         f"Knowledge context:\n{context_text}"
     )
 
-    llm_reply = _groq_chat(system_prompt, user_context)
+    llm_reply = _groq_chat(system_prompt, user_context, chat_history)
     if llm_reply:
         state["llm_mode"] = "groq"
         state["reply"] = llm_reply
@@ -762,19 +764,24 @@ def _sync_tool_result_to_session(tool_name: str, result: Any) -> None:
         st.session_state["predict_result"] = result
 
 
-def _groq_chat(system_prompt: str, user_prompt: str) -> str | None:
+def _groq_chat(system_prompt: str, user_prompt: str, history: list[dict[str, str]] | None = None) -> str | None:
     api_key = _get_groq_api_key()
     if not api_key:
         st.session_state["last_groq_error"] = "Missing GROQ_API_KEY."
         return None
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    if history:
+        for item in history[-5:]:
+            role = str(item.get("role", "")).strip().lower()
+            content = str(item.get("content", "")).strip()
+            if role in {"user", "assistant"} and content:
+                messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_prompt})
     payload = json.dumps(
         {
             "model": "llama-3.3-70b-versatile",
             "temperature": 0.4,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": messages,
         }
     ).encode("utf-8")
     req = request.Request(
@@ -966,6 +973,7 @@ def _render_coach() -> None:
             "query": user_prompt,
             "predict_result": predict_result,
             "roadmap": roadmap,
+            "chat_history": st.session_state.get("chat_history", [])[-5:],
         }
     )
     context_hits = rag_result.get("context_hits", [])
