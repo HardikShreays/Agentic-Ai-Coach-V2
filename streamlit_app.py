@@ -10,6 +10,7 @@ from typing import Any
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 import streamlit as st
+from langchain_core.tools import tool
 from langgraph.graph import END, StateGraph
 from urllib import error, request
 
@@ -314,52 +315,19 @@ def _agent_run_tool_node(state: CoachRAGState) -> CoachRAGState:
     args = plan.get("args", {}) if isinstance(plan.get("args"), dict) else {}
     tool_result: dict[str, Any] = {"tool_name": tool_name, "ok": False, "result": None, "error": None}
     try:
-        if tool_name == "evaluate_resume":
-            resume_text = str(args.get("resume_text", "")).strip()
-            target_role = str(args.get("target_role", "Software Engineer")).strip() or "Software Engineer"
-            if resume_text:
-                tool_result["result"] = _evaluate_resume(resume_text, target_role)
-                tool_result["ok"] = True
-            else:
-                tool_result["error"] = "Missing required arg: resume_text."
-        elif tool_name == "evaluate_resume_ai":
-            resume_text = str(args.get("resume_text", "")).strip() or st.session_state.get("latest_resume_text", "")
-            target_role = (
-                str(args.get("target_role", "")).strip()
-                or st.session_state.get("latest_resume_target_role", "")
-                or "Software Engineer"
-            )
-            if resume_text:
-                tool_result["result"] = _evaluate_resume_ai(resume_text, target_role)
-                tool_result["ok"] = True
-            else:
-                tool_result["error"] = "Missing resume text. Paste resume in Resume Evaluation page first, or provide it in chat."
-        elif tool_name == "generate_roadmap":
-            role = str(args.get("role", "Software Engineer")).strip() or "Software Engineer"
-            timeline = str(args.get("timeline", "6 months"))
-            if timeline not in {"3 months", "6 months", "12 months"}:
-                timeline = "6 months"
-            raw_skills = args.get("skills", [])
-            skills = [str(s).strip() for s in raw_skills] if isinstance(raw_skills, list) else []
-            weekly_hours = int(args.get("weekly_hours", 10))
-            weekly_hours = max(3, min(30, weekly_hours))
-            context = str(args.get("context", ""))
-            roadmap = _generate_roadmap(role, timeline, skills, weekly_hours, context)
-            st.session_state["roadmap"] = roadmap
-            tool_result["result"] = roadmap
-            tool_result["ok"] = True
-        elif tool_name == "predict_score":
-            hours = float(args.get("hours", 16.0))
-            attendance = float(args.get("attendance", 82.0))
-            previous = float(args.get("previous", 75.0))
-            sleep = float(args.get("sleep", 7.0))
-            motivation = int(args.get("motivation", 3))
-            prediction = _predict_score(hours, attendance, previous, sleep, motivation)
-            st.session_state["predict_result"] = prediction
-            tool_result["result"] = prediction
-            tool_result["ok"] = True
-        else:
+        registry = _tool_registry()
+        selected_tool = registry.get(tool_name)
+        if selected_tool is None:
             tool_result["error"] = "No executable tool selected."
+        else:
+            prepared_args = _prepare_tool_args(tool_name, args)
+            if isinstance(prepared_args, dict) and prepared_args.get("__error__"):
+                tool_result["error"] = prepared_args["__error__"]
+            else:
+                result = selected_tool.invoke(prepared_args)
+                _sync_tool_result_to_session(tool_name, result)
+                tool_result["result"] = result
+                tool_result["ok"] = True
     except Exception as exc:
         tool_result["error"] = str(exc)
     state["tool_result"] = tool_result
@@ -680,6 +648,100 @@ def _evaluate_resume_ai(resume_text: str, target_role: str) -> dict[str, Any]:
         "strengths": strengths[:5] if strengths else base_report["strengths"],
         "gaps": gaps[:5] if gaps else base_report["gaps"],
     }
+
+
+@tool
+def predict_score_tool(hours: float, attendance: float, previous: float, sleep: float, motivation: int) -> dict[str, Any]:
+    """Predict performance score from study, attendance, sleep, and motivation."""
+    return _predict_score(float(hours), float(attendance), float(previous), float(sleep), int(motivation))
+
+
+@tool
+def generate_roadmap_tool(
+    role: str,
+    timeline: str,
+    skills: list[str] | None = None,
+    weekly_hours: int = 10,
+    context: str = "",
+) -> dict[str, Any]:
+    """Generate a role-based roadmap with milestones and measurable goals."""
+    safe_role = role.strip() or "Software Engineer"
+    safe_timeline = timeline if timeline in {"3 months", "6 months", "12 months"} else "6 months"
+    safe_skills = [str(s).strip() for s in (skills or []) if str(s).strip()]
+    safe_weekly_hours = max(3, min(30, int(weekly_hours)))
+    return _generate_roadmap(safe_role, safe_timeline, safe_skills, safe_weekly_hours, str(context))
+
+
+@tool
+def evaluate_resume_tool(resume_text: str, target_role: str = "Software Engineer") -> dict[str, Any]:
+    """Run rule-based resume evaluation and return strengths and gaps."""
+    return _evaluate_resume(resume_text.strip(), target_role.strip() or "Software Engineer")
+
+
+@tool
+def evaluate_resume_ai_tool(resume_text: str, target_role: str = "Software Engineer") -> dict[str, Any]:
+    """Run AI-powered resume evaluation with structured feedback."""
+    return _evaluate_resume_ai(resume_text.strip(), target_role.strip() or "Software Engineer")
+
+
+def _tool_registry():
+    return {
+        "predict_score": predict_score_tool,
+        "generate_roadmap": generate_roadmap_tool,
+        "evaluate_resume": evaluate_resume_tool,
+        "evaluate_resume_ai": evaluate_resume_ai_tool,
+    }
+
+
+def _prepare_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    if tool_name == "evaluate_resume_ai":
+        resume_text = str(args.get("resume_text", "")).strip() or st.session_state.get("latest_resume_text", "")
+        target_role = (
+            str(args.get("target_role", "")).strip()
+            or st.session_state.get("latest_resume_target_role", "")
+            or "Software Engineer"
+        )
+        if not resume_text:
+            return {
+                "__error__": "Missing resume text. Paste resume in Resume Evaluation page first, or provide it in chat."
+            }
+        return {"resume_text": resume_text, "target_role": target_role}
+
+    if tool_name == "evaluate_resume":
+        resume_text = str(args.get("resume_text", "")).strip()
+        target_role = str(args.get("target_role", "Software Engineer")).strip() or "Software Engineer"
+        if not resume_text:
+            return {"__error__": "Missing required arg: resume_text."}
+        return {"resume_text": resume_text, "target_role": target_role}
+
+    if tool_name == "generate_roadmap":
+        raw_skills = args.get("skills", [])
+        skills = [str(s).strip() for s in raw_skills] if isinstance(raw_skills, list) else []
+        return {
+            "role": str(args.get("role", "Software Engineer")).strip() or "Software Engineer",
+            "timeline": str(args.get("timeline", "6 months")),
+            "skills": skills,
+            "weekly_hours": int(args.get("weekly_hours", 10)),
+            "context": str(args.get("context", "")),
+        }
+
+    if tool_name == "predict_score":
+        return {
+            "hours": float(args.get("hours", 16.0)),
+            "attendance": float(args.get("attendance", 82.0)),
+            "previous": float(args.get("previous", 75.0)),
+            "sleep": float(args.get("sleep", 7.0)),
+            "motivation": int(args.get("motivation", 3)),
+        }
+
+    return args
+
+
+def _sync_tool_result_to_session(tool_name: str, result: Any) -> None:
+    if tool_name == "generate_roadmap" and isinstance(result, dict):
+        st.session_state["roadmap"] = result
+    elif tool_name == "predict_score" and isinstance(result, dict):
+        st.session_state["predict_result"] = result
 
 
 def _groq_chat(system_prompt: str, user_prompt: str) -> str | None:
