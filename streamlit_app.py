@@ -63,6 +63,19 @@ def _load_env_file() -> None:
 _load_env_file()
 
 
+def _get_groq_api_key() -> str:
+    env_key = (os.getenv("GROQ_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+    try:
+        secret_key = st.secrets.get("GROQ_API_KEY", "")
+        if isinstance(secret_key, str):
+            return secret_key.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _grade(score: float) -> str:
     if score >= 90:
         return "A+"
@@ -745,7 +758,7 @@ def _sync_tool_result_to_session(tool_name: str, result: Any) -> None:
 
 
 def _groq_chat(system_prompt: str, user_prompt: str) -> str | None:
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = _get_groq_api_key()
     if not api_key:
         return None
     payload = json.dumps(
@@ -1006,7 +1019,7 @@ def main() -> None:
     st.caption("Standalone app with prediction, roadmap, coach, resume evaluation, and KB retrieval.")
 
     page = st.sidebar.radio("Navigation", ["Predict", "Roadmap", "AI Coach", "Resume Evaluation", "Knowledge Base", "Notes"])
-    st.sidebar.write(f"GROQ key configured: {'Yes' if bool(os.getenv('GROQ_API_KEY')) else 'No'}")
+    st.sidebar.write(f"GROQ key configured: {'Yes' if bool(_get_groq_api_key()) else 'No'}")
     if not _vector_db_available():
         st.sidebar.warning(
             "Embedding retrieval is unavailable in this runtime. "
