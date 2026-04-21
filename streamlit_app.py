@@ -6,14 +6,30 @@ import re
 from pathlib import Path
 from typing import Any
 
+# Silence Chroma telemetry errors in some local environments.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
 import streamlit as st
+from langgraph.graph import END, StateGraph
 from urllib import error, request
+
+try:
+    import chromadb  # type: ignore
+except Exception:
+    chromadb = None
+
+try:
+    from sentence_transformers import SentenceTransformer  # type: ignore
+except Exception:
+    SentenceTransformer = None
 
 st.set_page_config(page_title="AcadPipeline", page_icon="🎓", layout="wide")
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 KB_FILE = DATA_DIR / "knowledge_base.json"
+VECTOR_DB_DIR = DATA_DIR / "vector_db"
+VECTOR_COLLECTION = "acadpipeline_kb"
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 
 
@@ -103,6 +119,52 @@ def _load_kb() -> list[dict[str, str]]:
         return []
 
 
+@st.cache_resource
+def _get_embedding_model():
+    if SentenceTransformer is None:
+        return None
+    try:
+        return SentenceTransformer("all-MiniLM-L6-v2")
+    except Exception:
+        return None
+
+
+def _vector_db_available() -> bool:
+    return chromadb is not None and _get_embedding_model() is not None
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    model = _get_embedding_model()
+    if model is None:
+        return []
+    vectors = model.encode(texts, normalize_embeddings=True)
+    return [v.tolist() for v in vectors]
+
+
+def _rebuild_vector_index_from_kb() -> bool:
+    docs = _load_kb()
+    if not docs or not _vector_db_available():
+        return False
+    try:
+        client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
+        collection = client.get_or_create_collection(name=VECTOR_COLLECTION, metadata={"hnsw:space": "cosine"})
+        existing = collection.get()
+        existing_ids = existing.get("ids", []) if isinstance(existing, dict) else []
+        if existing_ids:
+            collection.delete(ids=existing_ids)
+
+        doc_texts = [d["content"] for d in docs]
+        doc_ids = [f"doc-{idx}" for idx in range(len(docs))]
+        metadatas = [{"title": d["title"]} for d in docs]
+        embeddings = _embed_texts(doc_texts)
+        if not embeddings:
+            return False
+        collection.add(ids=doc_ids, documents=doc_texts, metadatas=metadatas, embeddings=embeddings)
+        return True
+    except Exception:
+        return False
+
+
 def _ingest_kb(raw_text: str) -> int:
     blocks = [b.strip() for b in raw_text.split("\n\n") if b.strip()]
     docs: list[dict[str, str]] = []
@@ -111,10 +173,43 @@ def _ingest_kb(raw_text: str) -> int:
         title = lines[0][:80].strip() or f"Document {i}"
         docs.append({"title": title, "content": block})
     KB_FILE.write_text(json.dumps(docs, indent=2), encoding="utf-8")
+    _rebuild_vector_index_from_kb()
     return len(docs)
 
 
 def _retrieve_context(query: str, top_k: int = 3) -> list[dict[str, Any]]:
+    if _vector_db_available():
+        try:
+            client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
+            collection = client.get_or_create_collection(name=VECTOR_COLLECTION, metadata={"hnsw:space": "cosine"})
+            # Lazy (re)build when collection is empty or missing docs.
+            peek = collection.peek(limit=1)
+            if not peek.get("ids"):
+                _rebuild_vector_index_from_kb()
+                collection = client.get_or_create_collection(name=VECTOR_COLLECTION, metadata={"hnsw:space": "cosine"})
+
+            query_embedding = _embed_texts([query])
+            if query_embedding:
+                res = collection.query(
+                    query_embeddings=query_embedding,
+                    n_results=top_k,
+                    include=["documents", "metadatas", "distances"],
+                )
+                docs_out = res.get("documents", [[]])
+                metas_out = res.get("metadatas", [[]])
+                dists_out = res.get("distances", [[]])
+                hits: list[dict[str, Any]] = []
+                if docs_out and metas_out and dists_out:
+                    for doc_text, meta, dist in zip(docs_out[0], metas_out[0], dists_out[0]):
+                        title = meta.get("title", "Knowledge Doc") if isinstance(meta, dict) else "Knowledge Doc"
+                        score = max(0.0, min(1.0, 1.0 - float(dist)))
+                        hits.append({"doc": {"title": title, "content": doc_text}, "score": score})
+                if hits:
+                    return hits
+        except Exception:
+            pass
+
+    # Fallback lexical retrieval when vector-db path is unavailable.
     docs = _load_kb()
     ranked = sorted(
         [{"doc": d, "score": _jaccard_score(query, d["content"])} for d in docs],
@@ -122,6 +217,251 @@ def _retrieve_context(query: str, top_k: int = 3) -> list[dict[str, Any]]:
         reverse=True,
     )
     return [r for r in ranked[:top_k] if r["score"] > 0.0]
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+    cleaned = text.strip()
+    try:
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _heuristic_plan_from_prompt(user_prompt: str) -> dict[str, Any]:
+    prompt = user_prompt.lower()
+    timeline_match = re.search(r"\b(3|6|12)[-\s]?month", prompt)
+    timeline = f"{timeline_match.group(1)} months" if timeline_match else "6 months"
+    role_match = re.search(r"for\s+([a-zA-Z][a-zA-Z0-9\s/&-]{2,40})", user_prompt, flags=re.IGNORECASE)
+    role = role_match.group(1).strip(" .,!?:;") if role_match else "Software Engineer"
+
+    if "roadmap" in prompt or "plan" in prompt:
+        return {
+            "action": "tool",
+            "tool_name": "generate_roadmap",
+            "args": {
+                "role": role,
+                "timeline": timeline if timeline in {"3 months", "6 months", "12 months"} else "6 months",
+                "skills": [],
+                "weekly_hours": 10,
+                "context": "",
+            },
+            "reason": "Detected roadmap request from user prompt.",
+        }
+    if "resume" in prompt and ("evaluate" in prompt or "review" in prompt or "score" in prompt):
+        return {
+            "action": "tool",
+            "tool_name": "evaluate_resume_ai",
+            "args": {"target_role": "Software Engineer"},
+            "reason": "Detected resume evaluation request.",
+        }
+    return {"action": "respond", "tool_name": "", "args": {}, "reason": "No tool intent detected."}
+
+
+class CoachRAGState(dict):
+    """Typed-like state container for LangGraph coach pipeline."""
+
+
+def _rag_retrieve_node(state: CoachRAGState) -> CoachRAGState:
+    query = state.get("query", "")
+    hits = _retrieve_context(query)
+    state["context_hits"] = hits
+    state["context_text"] = "\n".join(
+        [f"{idx + 1}. {hit['doc']['title']}: {hit['doc']['content']}" for idx, hit in enumerate(hits)]
+    )
+    return state
+
+
+def _agent_decide_node(state: CoachRAGState) -> CoachRAGState:
+    user_prompt = state.get("query", "")
+    system_prompt = (
+        "You are a planner for a student coaching agent.\n"
+        "Pick at most one tool to call based on user intent.\n"
+        "Available tools and strict args:\n"
+        "- evaluate_resume: {resume_text: str, target_role: str}\n"
+        "- evaluate_resume_ai: {resume_text?: str, target_role?: str} (uses latest resume from session when omitted)\n"
+        "- generate_roadmap: {role: str, timeline: '3 months'|'6 months'|'12 months', skills: [str], weekly_hours: int, context: str}\n"
+        "- predict_score: {hours: float, attendance: float, previous: float, sleep: float, motivation: int}\n"
+        "Return ONLY JSON with shape: "
+        '{"action":"tool|respond","tool_name":"...","args":{...},"reason":"..."}.\n'
+        "If required fields are missing, choose action=respond."
+    )
+    raw = _groq_chat(system_prompt, f"User message: {user_prompt}") or ""
+    plan = _extract_json_object(raw)
+    if not plan:
+        plan = _heuristic_plan_from_prompt(user_prompt)
+    elif str(plan.get("action", "")).lower() != "tool":
+        heuristic = _heuristic_plan_from_prompt(user_prompt)
+        if heuristic.get("action") == "tool":
+            plan = heuristic
+    state["plan"] = plan
+    return state
+
+
+def _agent_run_tool_node(state: CoachRAGState) -> CoachRAGState:
+    plan = state.get("plan", {})
+    tool_name = plan.get("tool_name", "")
+    args = plan.get("args", {}) if isinstance(plan.get("args"), dict) else {}
+    tool_result: dict[str, Any] = {"tool_name": tool_name, "ok": False, "result": None, "error": None}
+    try:
+        if tool_name == "evaluate_resume":
+            resume_text = str(args.get("resume_text", "")).strip()
+            target_role = str(args.get("target_role", "Software Engineer")).strip() or "Software Engineer"
+            if resume_text:
+                tool_result["result"] = _evaluate_resume(resume_text, target_role)
+                tool_result["ok"] = True
+            else:
+                tool_result["error"] = "Missing required arg: resume_text."
+        elif tool_name == "evaluate_resume_ai":
+            resume_text = str(args.get("resume_text", "")).strip() or st.session_state.get("latest_resume_text", "")
+            target_role = (
+                str(args.get("target_role", "")).strip()
+                or st.session_state.get("latest_resume_target_role", "")
+                or "Software Engineer"
+            )
+            if resume_text:
+                tool_result["result"] = _evaluate_resume_ai(resume_text, target_role)
+                tool_result["ok"] = True
+            else:
+                tool_result["error"] = "Missing resume text. Paste resume in Resume Evaluation page first, or provide it in chat."
+        elif tool_name == "generate_roadmap":
+            role = str(args.get("role", "Software Engineer")).strip() or "Software Engineer"
+            timeline = str(args.get("timeline", "6 months"))
+            if timeline not in {"3 months", "6 months", "12 months"}:
+                timeline = "6 months"
+            raw_skills = args.get("skills", [])
+            skills = [str(s).strip() for s in raw_skills] if isinstance(raw_skills, list) else []
+            weekly_hours = int(args.get("weekly_hours", 10))
+            weekly_hours = max(3, min(30, weekly_hours))
+            context = str(args.get("context", ""))
+            roadmap = _generate_roadmap(role, timeline, skills, weekly_hours, context)
+            st.session_state["roadmap"] = roadmap
+            tool_result["result"] = roadmap
+            tool_result["ok"] = True
+        elif tool_name == "predict_score":
+            hours = float(args.get("hours", 16.0))
+            attendance = float(args.get("attendance", 82.0))
+            previous = float(args.get("previous", 75.0))
+            sleep = float(args.get("sleep", 7.0))
+            motivation = int(args.get("motivation", 3))
+            prediction = _predict_score(hours, attendance, previous, sleep, motivation)
+            st.session_state["predict_result"] = prediction
+            tool_result["result"] = prediction
+            tool_result["ok"] = True
+        else:
+            tool_result["error"] = "No executable tool selected."
+    except Exception as exc:
+        tool_result["error"] = str(exc)
+    state["tool_result"] = tool_result
+    return state
+
+
+def _should_run_tool(state: CoachRAGState) -> str:
+    plan = state.get("plan", {})
+    action = str(plan.get("action", "respond")).lower()
+    tool_name = str(plan.get("tool_name", ""))
+    if action == "tool" and tool_name in {"evaluate_resume", "evaluate_resume_ai", "generate_roadmap", "predict_score"}:
+        return "run_tool"
+    return "generate"
+
+
+def _rag_generate_node(state: CoachRAGState) -> CoachRAGState:
+    user_prompt = state.get("query", "")
+    predict_result = st.session_state.get("predict_result")
+    roadmap = st.session_state.get("roadmap")
+    context_text = state.get("context_text", "")
+    tool_result = state.get("tool_result")
+
+    system_prompt = (
+        "You are a concise career coach for college students. "
+        "Give practical next steps and avoid generic motivation-only advice. "
+        "If a tool_result exists, use it explicitly in the answer."
+    )
+    user_context = (
+        f"User message: {user_prompt}\n"
+        f"Predicted score context: {predict_result}\n"
+        f"Roadmap context: {roadmap}\n"
+        f"Tool result context: {tool_result}\n"
+        f"Knowledge context:\n{context_text}"
+    )
+
+    llm_reply = _groq_chat(system_prompt, user_context)
+    if llm_reply:
+        state["reply"] = llm_reply
+        return state
+
+    if tool_result and tool_result.get("ok"):
+        name = tool_result.get("tool_name")
+        result = tool_result.get("result")
+        if name == "generate_roadmap" and isinstance(result, dict):
+            milestones = result.get("milestones", [])
+            top_milestones = "\n".join([
+                (
+                    f"- Month {m.get('month')}: {m.get('task')}\n"
+                    f"  Topics: {', '.join(m.get('topics', [])[:2])}\n"
+                    f"  Deliverable: {m.get('deliverable', 'Portfolio task')}"
+                )
+                for m in milestones[:3]
+                if isinstance(m, dict)
+            ])
+            state["reply"] = (
+                f"Generated your roadmap: {result.get('summary', '')}\n\n"
+                f"Start with these milestones:\n{top_milestones or '- Month 1: Set foundation and revise core concepts.'}\n\n"
+                f"Weekly measurable goal: {(result.get('measurable_goals') or ['Track weekly hours and complete 2 mocks.'])[0]}"
+            )
+            return state
+        if name == "predict_score" and isinstance(result, dict):
+            state["reply"] = (
+                f"Prediction complete: {result.get('score')}/100 ({result.get('grade')}). "
+                f"Cluster: {result.get('cluster')}."
+            )
+            return state
+        if name == "evaluate_resume" and isinstance(result, dict):
+            state["reply"] = (
+                f"Resume evaluation complete: {result.get('overall')}/100 - {result.get('verdict')}.\n"
+                f"Top gap: {(result.get('gaps') or ['No major gaps detected.'])[0]}"
+            )
+            return state
+        if name == "evaluate_resume_ai" and isinstance(result, dict):
+            state["reply"] = (
+                f"AI resume evaluation complete: {result.get('overall')}/100 - {result.get('verdict')}.\n"
+                f"Top strengths: {', '.join((result.get('strengths') or ['Not available'])[:2])}\n"
+                f"Top gap: {(result.get('gaps') or ['No major gaps detected.'])[0]}"
+            )
+            return state
+
+    state["reply"] = _local_coach_reply(
+        user_prompt,
+        predict_result["score"] if predict_result else None,
+        roadmap,
+        state.get("context_hits", []),
+    )
+    return state
+
+
+@st.cache_resource
+def _build_coach_rag_graph():
+    graph = StateGraph(dict)
+    graph.add_node("retrieve", _rag_retrieve_node)
+    graph.add_node("decide", _agent_decide_node)
+    graph.add_node("run_tool", _agent_run_tool_node)
+    graph.add_node("generate", _rag_generate_node)
+    graph.set_entry_point("retrieve")
+    graph.add_edge("retrieve", "decide")
+    graph.add_conditional_edges("decide", _should_run_tool, {"run_tool": "run_tool", "generate": "generate"})
+    graph.add_edge("run_tool", "generate")
+    graph.add_edge("generate", END)
+    return graph.compile()
 
 
 def _predict_score(hours: float, attendance: float, previous: float, sleep: float, motivation: int) -> dict[str, Any]:
@@ -157,28 +497,111 @@ def _predict_score(hours: float, attendance: float, previous: float, sleep: floa
 
 def _generate_roadmap(role: str, timeline: str, skills: list[str], weekly_hours: int, context: str) -> dict[str, Any]:
     months = {"3 months": 3, "6 months": 6, "12 months": 12}[timeline]
+    role_key = role.lower()
+    role_is_data = any(k in role_key for k in ["data analyst", "analyst", "business analyst", "bi analyst"])
+
+    if role_is_data:
+        topic_pool = [
+            "Excel advanced formulas (INDEX/MATCH, XLOOKUP), PivotTables, data cleaning",
+            "SQL fundamentals: SELECT, JOINs, GROUP BY, HAVING, window functions",
+            "Statistics for analytics: distributions, hypothesis testing, confidence intervals",
+            "Python for analysis: pandas, numpy, matplotlib/seaborn",
+            "Dashboarding: Power BI or Tableau with business KPIs",
+            "Case studies: conversion funnel, retention/churn, cohort and A/B analysis",
+            "Storytelling: insight framing, recommendations, stakeholder communication",
+        ]
+        project_pool = [
+            "E-commerce sales dashboard with month-over-month KPI tracking",
+            "Customer churn analysis with segment-level recommendations",
+            "Marketing campaign performance analysis with attribution insights",
+        ]
+        interview_pool = [
+            "SQL query drills (easy-medium joins and aggregations)",
+            "Product metrics and business case walkthroughs",
+            "Explain one dashboard and one analysis end-to-end",
+        ]
+        certs = ["Google Data Analytics", "Microsoft PL-300 (Power BI)", "SQL HackerRank practice track"]
+    else:
+        topic_pool = [
+            "Core DSA patterns: arrays, strings, hash maps, trees, graphs, DP",
+            "Language depth in primary stack (Python/Java/JS): OOP, error handling, testing",
+            "Backend fundamentals: REST APIs, auth, database modeling",
+            "System design basics: scalability, caching, queues, CAP trade-offs",
+            "Cloud/devops basics: Docker, CI/CD, deployment and monitoring",
+            "Behavioral preparation with STAR and impact storytelling",
+        ]
+        project_pool = [
+            "Full-stack CRUD app with auth and role-based access",
+            "Scalable API service with caching and async processing",
+            "Production-style deployed portfolio project with tests",
+        ]
+        interview_pool = [
+            "2 coding rounds/week and 1 timed mock round",
+            "System design whiteboard for one common architecture/week",
+            "Behavioral stories for conflict, impact, leadership, failure",
+        ]
+        certs = ["AWS Cloud Practitioner", "Meta Backend/Frontend cert", "System Design primer track"]
+
     milestones = []
     for month in range(1, months + 1):
+        topic_idx_start = ((month - 1) * 2) % len(topic_pool)
+        month_topics = topic_pool[topic_idx_start : topic_idx_start + 2]
+        if len(month_topics) < 2:
+            month_topics += topic_pool[: 2 - len(month_topics)]
+
         if month == 1:
-            item = "Set foundation and revise core concepts."
-        elif month <= months // 2:
-            item = "Build guided projects and practice interviews."
+            task = "Foundation sprint: set baseline, close fundamentals, and build study system."
+        elif month <= max(2, months // 2):
+            task = "Skill build: complete core topics and create mini deliverables."
         elif month < months:
-            item = "Ship portfolio project and strengthen resume."
+            task = "Portfolio + applied practice: ship strong project artifacts."
         else:
-            item = "Apply strategically and run mock interviews."
-        milestones.append({"month": month, "task": item})
-    courses = [
-        {"name": "Data Structures and Algorithms", "platform": "LeetCode / GFG", "duration": "8 weeks"},
-        {"name": f"{role} Fundamentals", "platform": "Coursera / YouTube", "duration": "6 weeks"},
-        {"name": "System Design Basics", "platform": "Educative", "duration": "4 weeks"},
+            task = "Interview and placement sprint: applications, mocks, and polishing."
+
+        milestones.append(
+            {
+                "month": month,
+                "task": task,
+                "topics": month_topics,
+                "deliverable": project_pool[(month - 1) % len(project_pool)],
+                "interview_focus": interview_pool[(month - 1) % len(interview_pool)],
+            }
+        )
+
+    weekly_plan = [
+        {"day": "Mon", "focus": "Learn new topic (90-120 min) + notes"},
+        {"day": "Tue", "focus": "Hands-on practice/problem set (90-120 min)"},
+        {"day": "Wed", "focus": "Mini-project/dashboard/code implementation"},
+        {"day": "Thu", "focus": "Revision + weak area drill"},
+        {"day": "Fri", "focus": "Mock interview/case/quiz"},
+        {"day": "Sat", "focus": "Portfolio polish + LinkedIn/GitHub update"},
+        {"day": "Sun", "focus": "Weekly review: track KPIs, plan next week"},
     ]
+
+    courses = [
+        {"name": f"{role} Fundamentals", "platform": "Coursera / YouTube", "duration": "6-8 weeks"},
+        {"name": "Practical Project Track", "platform": "Kaggle / GitHub / Personal", "duration": "8-12 weeks"},
+        {"name": "Interview Preparation Track", "platform": "LeetCode / Case Library", "duration": "4-6 weeks"},
+    ]
+
+    measurable_goals = [
+        f"Study {weekly_hours} focused hours every week.",
+        "Publish at least 1 portfolio artifact every 4 weeks.",
+        "Complete 2 interview practice sessions every week.",
+    ]
+
     return {
-        "summary": f"Focused {timeline} plan for {role} with about {weekly_hours} hours/week.",
+        "summary": f"Detailed {timeline} plan for {role} with {weekly_hours} hours/week and concrete monthly deliverables.",
         "skills": skills,
         "context": context,
         "milestones": milestones,
         "courses": courses,
+        "topic_pool": topic_pool,
+        "projects": project_pool,
+        "interview_prep": interview_pool,
+        "certifications": certs,
+        "weekly_plan": weekly_plan,
+        "measurable_goals": measurable_goals,
     }
 
 
@@ -222,6 +645,43 @@ def _evaluate_resume(resume_text: str, target_role: str) -> dict[str, Any]:
     }
 
 
+def _evaluate_resume_ai(resume_text: str, target_role: str) -> dict[str, Any]:
+    base_report = _evaluate_resume(resume_text, target_role)
+    system_prompt = (
+        "You are an ATS and hiring resume reviewer. "
+        "Return ONLY JSON with keys: overall (0-100 int), verdict (str), strengths (list[str]), gaps (list[str]). "
+        "Be specific and actionable for college students."
+    )
+    user_prompt = (
+        f"Target role: {target_role}\n"
+        f"Resume text:\n{resume_text}\n\n"
+        f"Base rule-based report for calibration: {base_report}"
+    )
+    raw = _groq_chat(system_prompt, user_prompt)
+    parsed = _extract_json_object(raw or "")
+    if not parsed:
+        return base_report
+    try:
+        overall = int(parsed.get("overall", base_report["overall"]))
+    except (TypeError, ValueError):
+        overall = int(base_report["overall"])
+    strengths = parsed.get("strengths", base_report["strengths"])
+    gaps = parsed.get("gaps", base_report["gaps"])
+    if not isinstance(strengths, list) or not all(isinstance(x, str) for x in strengths):
+        strengths = base_report["strengths"]
+    if not isinstance(gaps, list) or not all(isinstance(x, str) for x in gaps):
+        gaps = base_report["gaps"]
+    verdict = parsed.get("verdict", base_report["verdict"])
+    if not isinstance(verdict, str):
+        verdict = base_report["verdict"]
+    return {
+        "overall": max(0, min(100, overall)),
+        "verdict": verdict,
+        "strengths": strengths[:5] if strengths else base_report["strengths"],
+        "gaps": gaps[:5] if gaps else base_report["gaps"],
+    }
+
+
 def _groq_chat(system_prompt: str, user_prompt: str) -> str | None:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -250,8 +710,31 @@ def _groq_chat(system_prompt: str, user_prompt: str) -> str | None:
         return None
 
 
-def _local_coach_reply(message: str, predicted_score: float | None, roadmap: dict[str, Any] | None) -> str:
+def _local_coach_reply(
+    message: str,
+    predicted_score: float | None,
+    roadmap: dict[str, Any] | None,
+    context_hits: list[dict[str, Any]] | None = None,
+) -> str:
+    msg = message.lower()
     tips = []
+    context_hits = context_hits or []
+
+    if any(k in msg for k in ["dsa", "data structure", "algorithm", "coding interview", "leetcode"]):
+        dsa_plan = [
+            "Week 1-2: Arrays, strings, hash maps, two pointers, sliding window.",
+            "Week 3-4: Linked list, stack, queue, recursion, binary search patterns.",
+            "Week 5-6: Trees, BST, heap/priority queue, graph BFS/DFS basics.",
+            "Week 7-8: Dynamic programming (1D/2D), greedy, backtracking.",
+            "Practice target: 2 medium + 3 easy problems per day, then 2 mocks/week.",
+        ]
+        tips.extend(dsa_plan)
+        if context_hits:
+            top_titles = [h.get("doc", {}).get("title", "") for h in context_hits[:2] if isinstance(h, dict)]
+            top_titles = [t for t in top_titles if t]
+            if top_titles:
+                tips.append(f"Use these KB notes first: {', '.join(top_titles)}.")
+
     if predicted_score is not None:
         if predicted_score < 65:
             tips.append("Increase consistency: 90-minute focused sessions for 5 days/week.")
@@ -261,9 +744,9 @@ def _local_coach_reply(message: str, predicted_score: float | None, roadmap: dic
             tips.append("Keep momentum and focus on interview practice + portfolio quality.")
     if roadmap:
         tips.append(f"Follow roadmap milestone for month {min(2, len(roadmap['milestones']))} before adding new topics.")
-    if "resume" in message.lower():
+    if "resume" in msg:
         tips.append("Prioritize impact bullets: action + metric + result.")
-    if "interview" in message.lower():
+    if "interview" in msg:
         tips.append("Do 2 mock interviews/week: one technical, one behavioral.")
     if not tips:
         tips.append("Set one measurable goal for this week and review progress every Sunday.")
@@ -326,14 +809,32 @@ def _render_roadmap() -> None:
         st.markdown("### Timeline")
         for item in roadmap["milestones"]:
             st.write(f"- Month {item['month']}: {item['task']}")
+            if item.get("topics"):
+                st.write(f"  - Topics: {', '.join(item['topics'])}")
+            if item.get("deliverable"):
+                st.write(f"  - Deliverable: {item['deliverable']}")
+            if item.get("interview_focus"):
+                st.write(f"  - Interview focus: {item['interview_focus']}")
+        if roadmap.get("weekly_plan"):
+            st.markdown("### Weekly Execution Plan")
+            for day_item in roadmap["weekly_plan"]:
+                st.write(f"- {day_item['day']}: {day_item['focus']}")
+        if roadmap.get("measurable_goals"):
+            st.markdown("### Measurable Goals")
+            for goal in roadmap["measurable_goals"]:
+                st.write(f"- {goal}")
         st.markdown("### Recommended Courses")
         for course in roadmap["courses"]:
             st.write(f"- {course['name']} ({course['platform']}, {course['duration']})")
+        if roadmap.get("certifications"):
+            st.markdown("### Certifications")
+            for cert in roadmap["certifications"]:
+                st.write(f"- {cert}")
 
 
 def _render_coach() -> None:
     st.subheader("AI Coach")
-    st.caption("Context-aware coach with local retrieval and optional GROQ response.")
+    st.caption("Agentic coach with RAG + tool calling (predict, roadmap, resume evaluation).")
     if "chat_history" not in st.session_state:
         st.session_state["chat_history"] = []
 
@@ -349,32 +850,24 @@ def _render_coach() -> None:
     with st.chat_message("user"):
         st.markdown(user_prompt)
 
-    context_hits = _retrieve_context(user_prompt)
-    context_text = "\n".join(
-        [f"{idx+1}. {hit['doc']['title']}: {hit['doc']['content']}" for idx, hit in enumerate(context_hits)]
-    )
     predict_result = st.session_state.get("predict_result")
     roadmap = st.session_state.get("roadmap")
-
-    system_prompt = (
-        "You are a concise career coach for college students. "
-        "Give practical next steps and avoid generic motivation-only advice."
+    coach_graph = _build_coach_rag_graph()
+    rag_result = coach_graph.invoke(
+        {
+            "query": user_prompt,
+            "predict_result": predict_result,
+            "roadmap": roadmap,
+        }
     )
-    user_context = (
-        f"User message: {user_prompt}\n"
-        f"Predicted score context: {predict_result}\n"
-        f"Roadmap context: {roadmap}\n"
-        f"Knowledge context:\n{context_text}"
-    )
-    llm_reply = _groq_chat(system_prompt, user_context)
-    reply = llm_reply or _local_coach_reply(
-        user_prompt,
-        predict_result["score"] if predict_result else None,
-        roadmap,
-    )
+    context_hits = rag_result.get("context_hits", [])
+    reply = rag_result.get("reply", "I could not generate a response right now.")
+    tool_result = rag_result.get("tool_result")
 
     with st.chat_message("assistant"):
         st.markdown(reply)
+        if tool_result and tool_result.get("ok"):
+            st.caption(f"Tool used: {tool_result.get('tool_name')}")
         if context_hits:
             st.caption("Used knowledge base context:")
             for hit in context_hits:
@@ -384,14 +877,19 @@ def _render_coach() -> None:
 
 def _render_resume_eval() -> None:
     st.subheader("Resume Evaluation")
-    st.caption("Structured ATS-style evaluation with strengths and gaps.")
+    st.caption("AI-powered ATS-style evaluation with rule-based fallback.")
     target_role = st.text_input("Target role", value="Software Engineer")
     resume_text = st.text_area("Paste resume text", height=260)
     if st.button("Evaluate Resume", use_container_width=True):
         if not resume_text.strip():
             st.warning("Please paste your resume text first.")
             return
-        report = _evaluate_resume(resume_text, target_role)
+        st.session_state["latest_resume_text"] = resume_text.strip()
+        st.session_state["latest_resume_target_role"] = target_role.strip() or "Software Engineer"
+        report = _evaluate_resume_ai(
+            st.session_state["latest_resume_text"],
+            st.session_state["latest_resume_target_role"],
+        )
         st.success(report["verdict"])
         st.metric("Overall Score", f"{report['overall']}/100")
         st.markdown("### Strengths")
@@ -431,9 +929,14 @@ def _render_setup() -> None:
     with c2:
         if st.button("Load default KB", use_container_width=True):
             KB_FILE.write_text(json.dumps(_default_kb_docs(), indent=2), encoding="utf-8")
+            _rebuild_vector_index_from_kb()
             st.success("Loaded default knowledge base.")
     docs = _load_kb()
     st.write(f"Current KB documents: {len(docs)}")
+    st.caption(
+        "Retrieval mode: "
+        + ("Embedding + Vector DB (Chroma)" if _vector_db_available() else "Lexical fallback (install vector deps)")
+    )
 
 
 def main() -> None:
