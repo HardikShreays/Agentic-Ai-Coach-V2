@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -779,7 +780,13 @@ def _groq_chat(system_prompt: str, user_prompt: str) -> str | None:
     req = request.Request(
         "https://api.groq.com/openai/v1/chat/completions",
         data=payload,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "AcadPipeline/1.0 (Streamlit; +https://streamlit.io)",
+            "X-Request-Id": str(uuid.uuid4()),
+        },
         method="POST",
     )
     try:
