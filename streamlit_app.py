@@ -311,6 +311,7 @@ def _agent_decide_node(state: CoachRAGState) -> CoachRAGState:
         "If required fields are missing, choose action=respond."
     )
     raw = _groq_chat(system_prompt, f"User message: {user_prompt}") or ""
+    state["planner_llm_error"] = st.session_state.get("last_groq_error", "")
     plan = _extract_json_object(raw)
     if not plan:
         plan = _heuristic_plan_from_prompt(user_prompt)
@@ -378,8 +379,11 @@ def _rag_generate_node(state: CoachRAGState) -> CoachRAGState:
 
     llm_reply = _groq_chat(system_prompt, user_context)
     if llm_reply:
+        state["llm_mode"] = "groq"
         state["reply"] = llm_reply
         return state
+    state["llm_mode"] = "local_fallback"
+    state["llm_error"] = st.session_state.get("last_groq_error", "")
 
     if tool_result and tool_result.get("ok"):
         name = tool_result.get("tool_name")
@@ -760,6 +764,7 @@ def _sync_tool_result_to_session(tool_name: str, result: Any) -> None:
 def _groq_chat(system_prompt: str, user_prompt: str) -> str | None:
     api_key = _get_groq_api_key()
     if not api_key:
+        st.session_state["last_groq_error"] = "Missing GROQ_API_KEY."
         return None
     payload = json.dumps(
         {
@@ -780,8 +785,29 @@ def _groq_chat(system_prompt: str, user_prompt: str) -> str | None:
     try:
         with request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
-    except (error.URLError, error.HTTPError, TimeoutError, KeyError, json.JSONDecodeError):
+            content = data["choices"][0]["message"]["content"]
+            st.session_state["last_groq_error"] = ""
+            return content
+    except error.HTTPError as exc:
+        details = ""
+        try:
+            details = exc.read().decode("utf-8")
+        except Exception:
+            details = ""
+        short_details = details[:220] if details else "No response body."
+        st.session_state["last_groq_error"] = f"HTTP {exc.code}: {short_details}"
+        return None
+    except error.URLError as exc:
+        st.session_state["last_groq_error"] = f"Network error: {exc.reason}"
+        return None
+    except TimeoutError:
+        st.session_state["last_groq_error"] = "Request timed out while contacting Groq."
+        return None
+    except (KeyError, json.JSONDecodeError) as exc:
+        st.session_state["last_groq_error"] = f"Invalid Groq response format: {exc}"
+        return None
+    except Exception as exc:
+        st.session_state["last_groq_error"] = f"Unexpected Groq error: {exc}"
         return None
 
 
@@ -938,9 +964,18 @@ def _render_coach() -> None:
     context_hits = rag_result.get("context_hits", [])
     reply = rag_result.get("reply", "I could not generate a response right now.")
     tool_result = rag_result.get("tool_result")
+    llm_mode = rag_result.get("llm_mode", "local_fallback")
+    llm_error = rag_result.get("llm_error", "")
 
     with st.chat_message("assistant"):
         st.markdown(reply)
+        if llm_mode == "local_fallback":
+            if llm_error:
+                st.warning(f"Using local fallback response. Groq error: {llm_error}")
+            else:
+                st.warning("Using local fallback response. Groq request did not return content.")
+        else:
+            st.caption("Response source: Groq LLM")
         if tool_result and tool_result.get("ok"):
             st.caption(f"Tool used: {tool_result.get('tool_name')}")
         if context_hits:
