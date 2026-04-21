@@ -1007,6 +1007,11 @@ def main() -> None:
 
     page = st.sidebar.radio("Navigation", ["Predict", "Roadmap", "AI Coach", "Resume Evaluation", "Knowledge Base", "Notes"])
     st.sidebar.write(f"GROQ key configured: {'Yes' if bool(os.getenv('GROQ_API_KEY')) else 'No'}")
+    if not _vector_db_available():
+        st.sidebar.warning(
+            "Embedding retrieval is unavailable in this runtime. "
+            "Coach will use lexical fallback retrieval until ML dependencies are installed."
+        )
     if page == "Predict":
         _render_predict()
     elif page == "Roadmap":
